@@ -221,6 +221,13 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
         }
+        // The OS is shutting down, restarting or signing the user out: close as a forced quit
+        // does, keeping unsaved changes for recovery (the window can't ask about them), for as
+        // long as the OS lets the app run (#17614).
+        #[cfg(target_os = "windows")]
+        if native_frame::session_ending() {
+            self.solve.quit_requested = true;
+        }
         // The window shows with its first frame: the starting page, before the slow setup.
         let mut setup = std::mem::take(&mut self.setup);
         let starting = setup.logic(self, ctx);
@@ -1333,8 +1340,9 @@ fn main() -> eframe::Result {
                     solidcraft_engine::note!("SolidCraft window: no class icon; the taskbar may show a generic one");
                 }
                 // The OS hit test offers the resize border, at the window's DPI, from the first
-                // message (#1381).
-                app.native_resize_border = custom_titlebar && native_frame::install(cc);
+                // message (#1381). The procedure is installed whatever frame the window has: it
+                // also answers the OS ending the session (#17614).
+                app.native_resize_border = native_frame::install(cc, custom_titlebar);
                 if custom_titlebar && !app.native_resize_border {
                     solidcraft_engine::note!("SolidCraft window: no native resize border; egui edge zones instead");
                 }

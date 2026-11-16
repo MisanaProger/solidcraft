@@ -15,6 +15,13 @@
 //! window rescales once at the crossing and stays under the pointer, instead of the OS's move
 //! loop and winit disagreeing about a frame the window doesn't have.
 //!
+//! It also answers `WM_ENDSESSION`: the OS is shutting down, restarting or signing the user out,
+//! and it may stop the process as soon as that message returns. SolidCraft ends its crash journal
+//! there and then, so the next start doesn't report a crash that never happened (#17614), and
+//! [`session_ending`] tells the app to close itself the way a forced quit does. The resize border
+//! and the DPI size are answered only for a window without OS decorations; this message is
+//! answered whatever frame the window has.
+//!
 //! Replacing a window procedure and setting a window class's icon have no safe API, hence the
 //! `unsafe_code` allowance on this module (the app crate denies it; see `native_crash.rs` and
 //! `open_documents.rs` for the others).
@@ -25,7 +32,7 @@
 //! mark even when the window is too busy to answer the taskbar's request for its icon.
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use solidcraft_ui_egui::titlebar;
@@ -36,7 +43,8 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GCLP_HICON, GCLP_HICONSM, GWL_STYLE, GWLP_WNDPROC, GetClientRect, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT,
     HTBOTTOMRIGHT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IMAGE_ICON, IsIconic, IsZoomed, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON,
-    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CXSMICON, SetWindowLongPtrW, WM_GETDPISCALEDSIZE, WM_NCDESTROY, WM_NCHITTEST, WNDPROC, WS_THICKFRAME,
+    SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SM_CXSMICON, SetWindowLongPtrW, WM_ENDSESSION, WM_GETDPISCALEDSIZE, WM_NCDESTROY, WM_NCHITTEST, WNDPROC,
+    WS_THICKFRAME,
 };
 // windows-sys has SetClassLongPtrW only on 64-bit targets; on 32-bit Windows it is SetClassLongW.
 #[cfg(target_pointer_width = "64")]
@@ -109,15 +117,26 @@ fn exe_icon(metric: i32, dpi: u32) -> Option<windows_sys::Win32::Foundation::HAN
 /// The window procedure ours replaced (winit's), as an address; 0 before [`install`].
 static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
 
-/// Answer the main window's hit test and DPI-size questions from now on. Call it once, on the
-/// thread that created the window (eframe's app creator). `false` if it isn't a Win32 window.
-pub fn install(window: &impl HasWindowHandle) -> bool {
+/// Answer the resize border and the DPI size as well ([`install`]'s `resize_border`).
+static BORDER: AtomicBool = AtomicBool::new(false);
+
+/// The OS ended the session: [`session_ending`].
+static ENDING: AtomicBool = AtomicBool::new(false);
+
+/// Answer the main window's messages from now on: the OS ending the session always, and its hit
+/// test and DPI-size questions when `resize_border` (the window has no OS decorations). Call it
+/// once, on the thread that created the window (eframe's app creator). Returns whether the resize
+/// border is answered: `false` when `resize_border` is false, when it isn't a Win32 window, and
+/// when the procedure is installed already.
+pub fn install(window: &impl HasWindowHandle, resize_border: bool) -> bool {
     let Ok(handle) = window.window_handle() else { return false };
     let RawWindowHandle::Win32(w) = handle.as_raw() else { return false };
     let hwnd = w.hwnd.get() as HWND;
     if PREVIOUS.load(Ordering::SeqCst) != 0 {
         return false;
     }
+    // Before the procedure is installed: the first message it gets reads the right answer.
+    BORDER.store(resize_border, Ordering::SeqCst);
     // SAFETY: `hwnd` is the live window eframe just created on this thread; `frame_proc` has the
     // WNDPROC signature and stays valid for the life of the process. SetWindowLongPtrW returns
     // the previous procedure, which `frame_proc` calls for every other message.
@@ -128,7 +147,14 @@ pub fn install(window: &impl HasWindowHandle) -> bool {
         return false;
     }
     PREVIOUS.store(previous as _, Ordering::SeqCst);
-    true
+    resize_border
+}
+
+/// The OS is ending the session: it is shutting down, restarting or signing the user out
+/// (`WM_ENDSESSION`). The app closes itself, keeping unsaved designs for recovery as a forced
+/// quit does, for as long as the OS lets it run.
+pub fn session_ending() -> bool {
+    ENDING.load(Ordering::SeqCst)
 }
 
 /// The procedure ours replaced.
@@ -143,14 +169,22 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
     // SAFETY: the arguments are the message as Windows delivered it to this window.
     let call_previous = || unsafe { CallWindowProcW(prev, hwnd, msg, wparam, lparam) };
     match msg {
-        WM_NCHITTEST => {
+        // Windows may stop the process as soon as this returns, so the crash journal's clean end
+        // is written here, not from a later frame that may never come: a shutdown is no crash
+        // (#17614). Ending the session twice is safe, so the app's own exit path still runs.
+        _ if session_end(msg, wparam) => {
+            ENDING.store(true, Ordering::SeqCst);
+            solidcraft_engine::crash::end_session();
+            call_previous()
+        }
+        WM_NCHITTEST if BORDER.load(Ordering::SeqCst) => {
             let default = call_previous();
             // Screen coordinates, signed (monitors left of or above the primary one).
             let (x, y) = (i32::from(lparam as u16 as i16), i32::from((lparam >> 16) as u16 as i16));
             // The border, else what winit and the system say (`HTCLIENT` everywhere else).
             border_hit(hwnd, x, y).map_or(default, |hit| hit as LRESULT)
         }
-        WM_GETDPISCALEDSIZE => {
+        WM_GETDPISCALEDSIZE if BORDER.load(Ordering::SeqCst) => {
             let new_dpi = wparam as u32;
             // SAFETY: for this message lParam points to a SIZE the system reads back.
             match (resizable(hwnd), client_size(hwnd), unsafe { (lparam as *mut SIZE).as_mut() }) {
@@ -178,6 +212,12 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         _ => call_previous(),
     }
+}
+
+/// The OS is ending the session: `WM_ENDSESSION` with a true `wparam`. A false one says a
+/// shutdown was called off, and the session goes on.
+fn session_end(msg: u32, wparam: WPARAM) -> bool {
+    msg == WM_ENDSESSION && wparam != 0
 }
 
 /// The window can be resized by its border now: it has the thick frame (not fullscreen, which
@@ -240,6 +280,16 @@ fn hit_code(d: egui::ResizeDirection) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only `WM_ENDSESSION` ends the session, and only when the session really is ending: a
+    /// shutdown another program called off leaves the app running, with its journal.
+    #[test]
+    fn only_a_session_that_really_ends_ends_it() {
+        assert!(session_end(WM_ENDSESSION, 1));
+        assert!(!session_end(WM_ENDSESSION, 0), "the shutdown was called off");
+        assert!(!session_end(WM_NCHITTEST, 1));
+        assert!(!session_ending(), "no message has said so");
+    }
 
     #[test]
     fn every_direction_has_its_own_hit_code() {

@@ -87,7 +87,7 @@ A folder `crashes/<YYYYMMDD-HHMMSS>-<signature>/`:
     - `command_panic`: a command hit an internal error; it was caught and the design was left unchanged
     - `kernel_panic_recovered`: the third-party geometry kernel panicked and was caught. This is harmless on the desktop, but it would crash the web build. A panic on a Rayon worker during a command is recorded this way, with that command and design, when the worker was inside the kernel guard or the command fails with a kernel error.
     - `panic`: an internal error outside any command. A Rayon worker panic while no command is running is still this kind, written at once.
-    - `unclean_exit`: a previous session ended without recording a clean exit. It is detected at the next start, which may be days later. Possible causes include an abort, a stack overflow, a segfault, a crash inside a graphics driver, a system shutdown, or the process being forcibly stopped. This kind alone does not identify the cause. When the app died while starting up, the message and `location` name the startup step (see below). On Windows and macOS, a captured native crash also says the exception or signal, the module it happened in and the offset into it.
+    - `unclean_exit`: a previous session ended without recording a clean exit. It is detected at the next start, which may be days later. Possible causes include an abort, a stack overflow, a segfault, a crash inside a graphics driver, a system shutdown, or the process being forcibly stopped. This kind alone does not identify the cause. On Windows, a shutdown, a restart or a sign-out ends the session cleanly while the app answers its messages (`WM_ENDSESSION`), so it is no longer reported; an app too busy to answer in time, and a forced stop such as End Task, still are. When the app died while starting up, the message and `location` name the startup step (see below). On Windows and macOS, a captured native crash also says the exception or signal, the module it happened in and the offset into it.
   - `message`, `location` (file:line), `thread`
   - `backtrace`: frames `symbol (file:line)`, without the panic machinery, std internals or the user's home folder
   - `app` (version, commit, build date), `system` (OS, architecture, renderer and GPU), `session.uptime_s`
@@ -131,7 +131,8 @@ Windows) still gets the startup step. Windows can also keep its own dumps of eve
 - **Before a crash:** the app keeps a journal of the top-level commands run on the design on
   screen (`crashes/sessions/*.jsonl`, at most 512 KB). Each command adds two small writes,
   with no flush to disk. Previews and other scratch sessions are not recorded. Each autosave
-  restarts the journal from the autosaved design. A clean exit deletes it. The journal file
+  restarts the journal from the autosaved design. A clean exit deletes it, and so does the OS
+  ending the session on Windows (a shutdown, a restart or a sign-out). The journal file
   is locked while its app runs, so at the next start, a journal nobody holds belongs to an
   app that died.
 - **A panic** captures its backtrace only the first time its signature is seen. The

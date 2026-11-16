@@ -260,6 +260,16 @@ fn child() {
             end_session();
             println!("CLEAN_READ_ONLY_OK");
         }
+        // The OS ends the session (a Windows shutdown, `WM_ENDSESSION`): the app ends it from the
+        // message itself, and its own exit path ends it again a moment later.
+        "os_session_end" => {
+            for _ in 0..3 {
+                let r = s.execute("diagnostics.crash_test", &json!({"mode": "panic"}));
+                assert!(matches!(r, Err(crate::EngineError::Internal(..))), "{r:?}");
+            }
+            end_session();
+            println!("OS_SESSION_END_OK");
+        }
         // A second install in the same process: the journal it opens is an orphan.
         "install_twice" => {
             install(dir.clone(), build());
@@ -475,6 +485,22 @@ fn a_clean_exit_whose_journal_cannot_be_removed_is_not_reported_as_an_unclean_ex
     assert!(out.contains("FRESH []"), "{out}");
     let reports = list(&d);
     assert!(reports.is_empty(), "{reports:?}");
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// The OS ending the session ends it once: the app's own exit path runs afterwards, and the
+/// panics it counted are not counted a second time.
+#[test]
+fn the_session_ending_twice_counts_each_panic_once() {
+    let d = fresh_dir("session-end-twice");
+    let (out, ok) = run_child(&d, "os_session_end");
+    assert!(ok && out.contains("OS_SESSION_END_OK"), "{out}");
+    let (s, _) = only_report(&d);
+    assert_eq!(s.kind, "command_panic");
+    assert_eq!(s.count, 3, "three panics: one written, two counted");
+    // And the next start has no journal to report: the session ended cleanly.
+    assert!(run_child(&d, "none").1);
+    assert_eq!(only_report(&d).0.count, 3, "no unclean exit, and no count written again");
     let _ = fs::remove_dir_all(&d);
 }
 

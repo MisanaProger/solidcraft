@@ -462,7 +462,9 @@ fn remove_stray_native_files(dir: &Path) {
     }
 }
 
-/// The app is closing normally: its journal goes, and repeat counts are written.
+/// The app is closing normally: its journal goes, and repeat counts are written. Safe to call
+/// more than once: the OS can end the session (a Windows shutdown, `WM_ENDSESSION`) while the
+/// app's own exit path still runs, and a count written by the first call is not written again.
 pub fn end_session() {
     let Some(s) = STATE.get() else { return };
     if let Ok(mut j) = s.journal.lock() {
@@ -476,7 +478,21 @@ pub fn end_session() {
             let _ = fs::remove_file(path);
         }
     }
-    let counts: Vec<(u64, String)> = s.known.lock().map(|k| k.values().filter(|(n, _)| *n > 0).cloned().collect()).unwrap_or_default();
+    // The counts are taken, not read: a second end leaves nothing left to write.
+    let counts: Vec<(u64, String)> = s
+        .known
+        .lock()
+        .map(|mut k| {
+            k.values_mut()
+                .filter(|(n, _)| *n > 0)
+                .map(|e| {
+                    let taken = (e.0, e.1.clone());
+                    e.0 = 0;
+                    taken
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     for (n, id) in counts {
         bump(&s.dir, &id, n);
     }
