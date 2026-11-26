@@ -9,8 +9,8 @@ use super::{
     FromBodiesResult, GroundParams, GroundResult, HistoryVisibilityParams, HistoryVisibilityResult, ListParams, ListResult, MoveBodiesParams,
     MoveBodiesResult, MoveFeaturesParams, MoveParams, MoveResult, MoveSketchesParams, MoveSketchesResult, MoveSketchesToPartsParams,
     OccurrenceAlignParams, OccurrenceAlignResult, OccurrencePropertiesParams, OccurrencePropertiesResult, PasteNewParams, PasteNewResult,
-    PropertiesParams, PropertiesResult, RenameParams, RenameResult, ReparentItemsParams, RevertPositionParams, RevertPositionResult, UnlockParams,
-    UnlockResult,
+    PropertiesParams, PropertiesResult, RenameParams, RenameResult, ReparentItemsParams, RevertPositionParams, RevertPositionResult, SetColorParams,
+    SetColorResult, UnlockParams, UnlockResult,
 };
 use crate::Session;
 use crate::schema::tests::{assert_keys, assert_strict_keeps_todays_errors, conforms};
@@ -41,7 +41,7 @@ fn schemas_and_the_key_check_agree() {
     assert_keys(input_schema_for::<MoveFeaturesParams>(), &["component", "features"]);
     assert_keys(input_schema_for::<MoveSketchesToPartsParams>(), &["sketches"]);
     assert_keys(input_schema_for::<ReparentItemsParams>(), &["bodies", "component", "component_path", "features", "occurrences"]);
-    assert_keys(input_schema_for::<CreateParams>(), &["activate", "grounded", "name", "parent", "parent_path"]);
+    assert_keys(input_schema_for::<CreateParams>(), &["activate", "bom_quantity", "grounded", "name", "parent", "parent_path", "virtual"]);
     assert_keys(input_schema_for::<FromBodiesParams>(), &["bodies"]);
     assert_keys(input_schema_for::<ActivateParams>(), &["component", "occurrence", "path"]);
     assert_keys(input_schema_for::<ListParams>(), &["bodies", "compact"]);
@@ -51,7 +51,8 @@ fn schemas_and_the_key_check_agree() {
     assert_keys(input_schema_for::<UnlockParams>(), &["component"]);
     assert_keys(input_schema_for::<HistoryVisibilityParams>(), &["component"]);
     assert_keys(input_schema_for::<CycleColorParams>(), &["component"]);
-    assert_keys(input_schema_for::<CapturePositionParams>(), &[]);
+    assert_keys(input_schema_for::<SetColorParams>(), &["color", "component"]);
+    assert_keys(input_schema_for::<CapturePositionParams>(), &["joints", "moves", "name"]);
     assert_keys(input_schema_for::<RevertPositionParams>(), &["occurrences"]);
     assert_keys(input_schema_for::<GroundParams>(), &["grounded", "occurrence", "path"]);
     assert_keys(input_schema_for::<CopyParams>(), &["component", "in_place", "occurrence", "parent", "parent_path", "path", "translate"]);
@@ -144,15 +145,15 @@ fn strict_keeps_todays_errors() {
     ]);
 }
 
-/// A name of 128 bytes is taken once trimmed, and one of 129 is not, as the handler counts.
+/// A name of 128 characters is taken once trimmed, and one of 129 is not, as the handler counts.
 #[test]
 fn a_name_is_counted_as_the_handler_counts_it() {
     let issues = |p: Value| crate::schema::issues("component.rename", &p).len();
     assert_eq!(issues(json!({"component": 0, "name": format!("  {}  ", "x".repeat(128))})), 0);
     assert_eq!(issues(json!({"component": 0, "name": "x".repeat(129)})), 1);
-    // 64 two-byte characters are 128 bytes.
-    assert_eq!(issues(json!({"component": 0, "name": "é".repeat(64)})), 0);
-    assert_eq!(issues(json!({"component": 0, "name": "é".repeat(65)})), 1);
+    // Characters, not bytes: 128 two-byte characters are taken.
+    assert_eq!(issues(json!({"component": 0, "name": "é".repeat(128)})), 0);
+    assert_eq!(issues(json!({"component": 0, "name": "é".repeat(129)})), 1);
 }
 
 /// The contracts say what the handlers need: a key a handler refuses without is required in the
@@ -286,10 +287,45 @@ fn the_check_reads_keys_as_the_handlers_do() {
     assert_eq!(issues("component.rename", json!({"component": 0, "name": ""})), ["`name` must be 1…128 characters"]);
 }
 
-fn matches(schema: schemars::Schema, id: &str, reply: &Value) {
-    let schema = schema.as_value();
+fn matches(schema: impl std::borrow::Borrow<schemars::Schema>, id: &str, reply: &Value) {
+    let schema = schema.borrow().as_value();
     assert!(conforms(schema, schema, reply), "{id}: {reply} doesn't match {schema}");
     assert!(reply.get("param_warnings").is_none(), "{id}: {reply}");
+}
+
+#[test]
+fn component_list_reports_occurrence_context() {
+    let mut s = Session { param_check: ParamCheck::Warn, ..Session::default() };
+    let schema = output_schema_for::<ListResult>();
+    let check = |s: &mut Session, component: u64, path: &[u64]| {
+        let before = (s.active_component, s.active_occurrence_path.clone(), s.revision);
+        for params in [json!({}), json!({"compact": true}), json!({"compact": true, "bodies": true})] {
+            let listed = s.execute("component.list", &params).unwrap();
+            assert_eq!(listed["active"], component);
+            assert_eq!(listed["active_path"], json!(path));
+            matches(&schema, "component.list", &listed);
+            let mut missing = listed.clone();
+            missing.as_object_mut().unwrap().remove("active_path");
+            assert!(!conforms(schema.as_value(), schema.as_value(), &missing), "active_path must always be present");
+        }
+        assert_eq!((s.active_component, s.active_occurrence_path.clone(), s.revision), before, "listing only reads the context");
+    };
+    check(&mut s, 0, &[]);
+    let parent = s.execute("component.create", &json!({"name": "Assembly", "grounded": false})).unwrap();
+    let leaf = s.execute("component.create", &json!({"name": "Carrier", "grounded": false})).unwrap();
+    let copy = s.execute("occurrence.copy", &json!({"component": parent["component"], "parent": 0})).unwrap();
+    let component = leaf["component"].as_u64().unwrap();
+    let original = [parent["occurrence"].as_u64().unwrap(), leaf["occurrence"].as_u64().unwrap()];
+    let copied = [copy["occurrence"].as_u64().unwrap(), leaf["occurrence"].as_u64().unwrap()];
+    // The same leaf occurrence belongs to two paths. Its id alone cannot restore the context.
+    for path in [original, copied] {
+        s.execute("component.activate", &json!({"component": component, "occurrence": path[1], "path": path})).unwrap();
+        check(&mut s, component, &path);
+    }
+    s.execute("component.activate", &json!({"component": component})).unwrap();
+    check(&mut s, component, &[]);
+    s.execute("component.activate", &json!({"component": 0})).unwrap();
+    check(&mut s, 0, &[]);
 }
 
 /// #16547: `component.hide_history` and `component.show_history` answer the component they changed
@@ -361,6 +397,49 @@ fn cycle_color_answers_the_component_and_its_colour() {
     // A key the command doesn't take is a warning, not a refusal, and the reply still matches.
     let warned = s.execute("component.cycle_color", &json!({"component": id, "components": id})).unwrap_or_else(|e| panic!("{e}"));
     assert!(warned["param_warnings"].as_array().is_some_and(|w| w.iter().any(|w| w.as_str().is_some_and(|w| w.contains("components")))), "{warned}");
+    assert!(conforms(&schema, &schema, &warned), "{warned} doesn't match {schema}");
+}
+
+/// #16677: `component.set_color` answers the component, the colour it shows now and whether that
+/// colour is its own; the published schema requires the component and takes the colour either way.
+#[test]
+fn set_color_answers_the_colour_and_whether_it_is_the_components_own() {
+    let mut s = Session { param_check: ParamCheck::Warn, ..Session::default() };
+    let id = s.execute("component.create", &json!({"name": "Arm"})).unwrap()["component"].as_u64().unwrap();
+    let schema = output_schema_for::<SetColorResult>().as_value().clone();
+    let described = s.execute("engine.describe", &json!({"command": "component.set_color"})).unwrap();
+    assert_eq!(described["input"]["required"], json!(["component"]), "the handler refuses a call without it");
+    assert_eq!(described["input"]["additionalProperties"], false);
+    let spec = crate::find_command("component.set_color").unwrap();
+    assert!(spec.contract.is_some() && spec.output.is_some() && spec.undoable, "the command describes itself and undoes");
+
+    // Both the name and the id are calls the command takes, and both colour forms are one colour.
+    for (key, color) in [(json!("Arm"), json!([12, 34, 56])), (json!(id), json!("#0c2238"))] {
+        let r = s.execute("component.set_color", &json!({"component": key, "color": color})).unwrap_or_else(|e| panic!("{key}: {e}"));
+        assert_eq!(r, json!({"component": id, "color": [12, 34, 56], "own": true}), "set_color changed the JSON it returned");
+        matches(output_schema_for::<SetColorResult>(), "component.set_color", &r);
+        assert_eq!(s.doc.component_identification_color(id), [12, 34, 56], "the design holds the colour it answered");
+    }
+    assert!(s.colored_components.is_none(), "the Component Colors flag is left as the window had it");
+    // No colour: the automatic one of its place in the palette, which is not the component's own.
+    let r = s.execute("component.set_color", &json!({"component": id})).unwrap();
+    assert_eq!(r, json!({"component": id, "color": s.doc.component_identification_color(id), "own": false}));
+    assert_ne!(r["color"], json!([12, 34, 56]), "the component no longer holds the colour it was given");
+    matches(output_schema_for::<SetColorResult>(), "component.set_color", &r);
+    // The design itself has no colour, a component that isn't there is refused, and so is a
+    // colour that is no colour.
+    for p in [
+        json!({"component": 0}),
+        json!({"component": "no such part"}),
+        json!({"component": id, "color": [12, 34]}),
+        json!({"component": id, "color": [12, 34, 560]}),
+        json!({"component": id, "color": "cornflower"}),
+    ] {
+        assert!(s.execute("component.set_color", &p).is_err(), "{p} should be refused");
+    }
+    // A key the command doesn't take is a warning, not a refusal, and the reply still matches.
+    let warned = s.execute("component.set_color", &json!({"component": id, "colour": [1, 2, 3]})).unwrap_or_else(|e| panic!("{e}"));
+    assert!(warned["param_warnings"].as_array().is_some_and(|w| w.iter().any(|w| w.as_str().is_some_and(|w| w.contains("colour")))), "{warned}");
     assert!(conforms(&schema, &schema, &warned), "{warned} doesn't match {schema}");
 }
 
@@ -482,7 +561,7 @@ fn replies_match_the_output_schemas_of_the_component_commands() {
     let inserted = run("file.insert_mesh", json!({"path": rig_file("rig"), "up": "z"}));
     let rig = inserted["component"].clone();
     let unlocked = run("component.unlock", json!({"component": rig}));
-    assert!(unlocked["joints"].as_array().is_some_and(|j| !j.is_empty()), "{unlocked}");
+    assert!(unlocked["rigid_group"].as_u64().is_some(), "{unlocked}");
     matches(output_schema_for::<UnlockResult>(), "component.unlock", &unlocked);
 
     // Misspelt keys still run in Warn, say so, and the reply still matches.
@@ -848,7 +927,17 @@ fn the_schemas_take_what_the_occurrence_handlers_read() {
         }
     };
     let matrix: Vec<i32> = FLAT_MATRIX.to_vec();
-    takes(input_schema_for::<CapturePositionParams>(), &[(json!({}), true), (json!({"x": 1}), false)]);
+    takes(
+        input_schema_for::<CapturePositionParams>(),
+        &[
+            (json!({}), true),
+            (json!({"name": "Cap1", "moves": [{"occurrence": 1, "translate": ["10 mm", 0, 0]}]}), true),
+            (json!({"joints": [{"joint": 1, "values": [5.0], "exprs": ["5 mm"]}]}), true),
+            (json!({"moves": [{"occurrence": 1, "bogus": 1}]}), false),
+            (json!({"joints": [{"joint": 1, "bogus": 1}]}), false),
+            (json!({"x": 1}), false),
+        ],
+    );
     takes(
         input_schema_for::<RevertPositionParams>(),
         &[(json!({}), true), (json!({"occurrences": [1, 2]}), true), (json!({"occurrences": []}), false), (json!({"occurrences": ["1"]}), false)],
@@ -893,6 +982,12 @@ fn the_schemas_take_what_the_occurrence_handlers_read() {
             (json!({"occurrence": 1, "angle": 0.5, "capture": false, "move_grounded": true, "path": [1]}), true),
             (json!({"occurrence": 1, "matrix": matrix, "tolerance": 1e-6}), true),
             (json!({"occurrence": 1, "matrix": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}), true),
+            // Length expressions in the translation column, `translate` and `origin` (#8192).
+            (json!({"occurrence": 1, "matrix": [1, 0, 0, "dx", 0, 1, 0, "dy + 1 mm", 0, 0, 1, 0]}), true),
+            (json!({"occurrence": 1, "matrix": [1, 0, 0, "dx", 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}), true),
+            (json!({"occurrence": 1, "matrix": [[1, 0, 0, "dx"], [0, 1, 0, 0], [0, 0, 1, "dz"]]}), true),
+            (json!({"occurrence": 1, "matrix": ["dx", 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]}), false),
+            (json!({"occurrence": 1, "translate": ["dx", 0, 0], "origin": [0, "dy", 0], "angle": 1}), true),
             (json!({"occurrence": 1, "base_transform": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]}), true),
             (json!({}), false),
             (json!({"occurrence": 1, "matrix": FLAT_MATRIX, "translate": [1, 0, 0]}), false),
@@ -1007,6 +1102,16 @@ fn the_check_reads_the_occurrence_keys_as_the_handlers_do() {
         ["translate entries must be numbers or length expressions"]
     );
     assert_eq!(issues("occurrence.copy", json!({"occurrence": 1, "translate": ["dy", 0, 0]})), ["translate must contain three finite numbers"]);
+    assert_eq!(issues("occurrence.move", json!({"occurrence": 1, "origin": ["0 mm", "dy", 0]})), none);
+    assert_eq!(
+        issues("occurrence.move", json!({"occurrence": 1, "origin": [true, "dy", 0]})),
+        ["origin entries must be numbers or length expressions"]
+    );
+    assert_eq!(issues("occurrence.move", json!({"occurrence": 1, "matrix": [1, 0, 0, "dy", 0, 1, 0, 0, 0, 0, 1, 0]})), none);
+    assert_eq!(
+        issues("occurrence.move", json!({"occurrence": 1, "matrix": ["dy", 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0]})),
+        ["matrix: only its translation column (entries 4, 8 and 12, or the last of each of the first three rows) can be a length expression"]
+    );
     assert_eq!(issues("occurrence.move", json!({"occurrence": 1, "axis": null})), ["axis must contain three finite numbers"]);
     assert_eq!(issues("occurrence.move", json!({"occurrence": 1, "origin": "x"})), ["origin must contain three finite numbers"]);
     assert_eq!(issues("occurrence.move", json!({"occurrence": 1, "angle": null})), ["angle must be a number or angle expression"]);
@@ -1116,9 +1221,11 @@ fn replies_match_the_output_schemas_of_the_occurrence_commands() {
     // Capture and Revert Position.
     let captured = run("component.capture_position", json!({}));
     assert_eq!(captured["captured"], 1, "{captured}");
+    assert!(captured["feature"].as_u64().is_some(), "{captured}");
     matches(output_schema_for::<CapturePositionResult>(), "component.capture_position", &captured);
     let captured = run("component.capture_position", json!({}));
     assert_eq!(captured["captured"], 0, "{captured}");
+    assert!(captured.get("feature").is_none(), "{captured}");
     matches(output_schema_for::<CapturePositionResult>(), "component.capture_position", &captured);
     run("occurrence.move", json!({"occurrence": pl, "capture": false, "translate": [0, 2, 0]}));
     let reverted = run("component.revert_position", json!({"occurrences": [pl]}));
